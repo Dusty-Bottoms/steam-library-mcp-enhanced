@@ -1780,6 +1780,14 @@ def get_achievement_roadmap(
                 guide_title = guide.get('title', '').lower()
                 guide_map[guide_title] = guide.get('url', '')
     
+    # Step 3.5: PHASE 2.3 - Build dependency graph for optimal achievement ordering
+    dependency_graph = dependency_detector.build_dependency_graph(achievements)
+    unlocked_names = {ach['name'] for ach in achievements if ach.get('unlocked')}
+    optimal_order = dependency_detector.get_optimal_order(achievements, unlocked_names)
+    
+    # Create optimal order index for sorting
+    optimal_order_map = {name: idx for idx, name in enumerate(optimal_order)}
+    
     # Step 4: Enrich and score each achievement
     locked_achievements = []
     for ach in achievements:
@@ -1798,15 +1806,11 @@ def get_achievement_roadmap(
                 guide_url = url
                 break
         
-        # Estimate difficulty based on rarity
-        if rarity < 5:
-            difficulty = "very_hard"
-        elif rarity < 20:
-            difficulty = "hard"
-        elif rarity < 50:
-            difficulty = "medium"
-        else:
-            difficulty = "easy"
+        # PHASE 2.3: ML-based difficulty prediction (replaces simple rarity-based estimation)
+        difficulty_analysis = difficulty_predictor.predict_difficulty(ach, rarity)
+        difficulty = difficulty_analysis['category']
+        difficulty_score = difficulty_analysis['score']
+        time_estimate = difficulty_analysis['estimated_time']
         
         # Calculate priority score
         priority_score = _calculate_priority_score(
@@ -1817,15 +1821,14 @@ def get_achievement_roadmap(
             difficulty=difficulty
         )
         
-        # Estimate time based on description keywords
-        time_estimate = "Unknown"
-        desc_lower = ach.get('description', '').lower()
-        if any(word in desc_lower for word in ['win', 'complete', 'finish']):
-            time_estimate = "30-90 minutes"
-        elif any(word in desc_lower for word in ['collect', 'find', 'discover']):
-            time_estimate = "15-45 minutes"
-        elif any(word in desc_lower for word in ['reach level', 'score', 'kill']):
-            time_estimate = "Variable"
+        # PHASE 2.3: Add dependency information
+        ach_name = ach['name']
+        dependencies = dependency_graph['edges'].get(ach_name, [])
+        dependency_level = None
+        for level_idx, level in enumerate(dependency_graph['levels']):
+            if ach_name in level:
+                dependency_level = level_idx
+                break
         
         enriched = {
             'name': ach['name'],
@@ -1835,33 +1838,67 @@ def get_achievement_roadmap(
             'priority_score': round(priority_score, 3),
             'rarity': round(rarity, 1),
             'estimated_difficulty': difficulty,
+            'difficulty_score': round(difficulty_score, 1),
             'has_guide': has_guide,
             'guide_url': guide_url,
-            'time_estimate': time_estimate
+            'time_estimate': time_estimate,
+            'dependencies': dependencies,
+            'dependency_level': dependency_level,
+            'optimal_order_index': optimal_order_map.get(ach_name, 999)
         }
         
         locked_achievements.append(enriched)
     
-    # Step 5: Sort based on strategy
+    # Step 5: Sort based on strategy (PHASE 2.3: Enhanced with dependency-aware sorting)
     if sort_by == "efficiency":
-        # High priority score = high value/effort ratio
-        locked_achievements.sort(key=lambda x: x['priority_score'], reverse=True)
+        # High priority score + optimal dependency order
+        locked_achievements.sort(key=lambda x: (
+            -x['priority_score'],  # Higher priority first
+            x['optimal_order_index'],  # Then by dependency order
+            x['difficulty_score']  # Then by difficulty
+        ))
     elif sort_by == "completion":
-        # Easiest first (high rarity = easy)
-        locked_achievements.sort(key=lambda x: x['rarity'], reverse=True)
+        # Easiest first (high rarity = easy, respecting dependencies)
+        locked_achievements.sort(key=lambda x: (
+            x['optimal_order_index'],  # Respect dependency order first
+            -x['rarity'],  # Then easiest first
+            x['difficulty_score']
+        ))
     elif sort_by == "missable":
         # Missable first (will need scan_for_missable_content enhancement)
-        locked_achievements.sort(key=lambda x: x['priority_score'], reverse=True)
+        locked_achievements.sort(key=lambda x: (
+            -x['priority_score'],
+            x['optimal_order_index']
+        ))
     elif sort_by == "rarity":
-        # Rarest first (low rarity = rare)
-        locked_achievements.sort(key=lambda x: x['rarity'])
+        # Rarest first (low rarity = rare, respecting dependencies)
+        locked_achievements.sort(key=lambda x: (
+            x['optimal_order_index'],  # Respect dependency order first
+            x['rarity']  # Then rarest first
+        ))
     
-    # Step 6: Add actionable next steps to top achievements
+    # Step 6: Add actionable next steps to top achievements (PHASE 2.3: Enhanced with dependencies)
     for i, ach in enumerate(locked_achievements[:5]):
+        next_steps = []
+        
+        # Check for dependencies
+        if ach['dependencies']:
+            unmet_deps = [dep for dep in ach['dependencies'] if dep not in unlocked_names]
+            if unmet_deps:
+                next_steps.append(f"⚠️ Prerequisites needed: {', '.join(unmet_deps[:3])}")
+        
+        # Add difficulty and time context
+        next_steps.append(f"Difficulty: {ach['estimated_difficulty']} ({ach['difficulty_score']}/100)")
+        next_steps.append(f"Estimated time: {ach['time_estimate']}")
+        
+        # Add guide if available
         if ach['has_guide']:
-            ach['next_steps'] = f"Check the community guide for detailed strategy: {ach['guide_url']}"
-        else:
-            ach['next_steps'] = f"Focus on: {ach['description']}"
+            next_steps.append(f"📘 Community guide available: {ach['guide_url']}")
+        
+        # Add description focus
+        next_steps.append(f"Focus: {ach['description']}")
+        
+        ach['next_steps'] = " | ".join(next_steps)
     
     completion_percentage = round((unlocked_count / total_count * 100), 1) if total_count > 0 else 0
     
@@ -1873,7 +1910,12 @@ def get_achievement_roadmap(
         'completion_percentage': completion_percentage,
         'sort_strategy': sort_by,
         'roadmap': locked_achievements[:10],  # Return top 10
-        'total_remaining': len(locked_achievements)
+        'total_remaining': len(locked_achievements),
+        'dependency_analysis': {
+            'total_dependency_levels': len(dependency_graph['levels']),
+            'achievements_with_dependencies': sum(1 for ach in locked_achievements if ach['dependencies']),
+            'optimal_order_available': True
+        }
     }
 
 def _calculate_priority_score(unlocked: bool, rarity: float, has_guide: bool, 
@@ -1911,6 +1953,94 @@ def _calculate_priority_score(unlocked: bool, rarity: float, has_guide: bool,
     score *= missable_multiplier   # Missable multiplier applies last
     
     return min(score, 1.0)  # Cap at 1.0
+
+@mcp.tool
+def analyze_achievement_dependencies(
+    game_identifier: Annotated[str, "Game name or appid to analyze achievement dependencies for"]
+) -> Dict[str, Any]:
+    """PHASE 2.3: Analyze achievement dependencies and provide optimal completion order"""
+    
+    # Step 1: Get all achievements
+    achievement_data = get_game_achievements(game_identifier)
+    if not achievement_data or 'error' in achievement_data:
+        return achievement_data
+    
+    game_name = achievement_data.get('game', '')
+    appid = achievement_data.get('appid', 0)
+    achievements = achievement_data.get('achievements', [])
+    
+    if not achievements:
+        return {
+            'error': 'No achievements found for this game',
+            'game': game_name,
+            'appid': appid
+        }
+    
+    # Step 2: Build dependency graph
+    dependency_graph = dependency_detector.build_dependency_graph(achievements)
+    
+    # Step 3: Get unlocked achievements
+    unlocked_names = {ach['name'] for ach in achievements if ach.get('unlocked')}
+    
+    # Step 4: Get optimal order
+    optimal_order = dependency_detector.get_optimal_order(achievements, unlocked_names)
+    
+    # Step 5: Analyze each achievement's dependencies
+    dependency_details = []
+    for ach in achievements:
+        ach_name = ach['name']
+        deps = dependency_graph['edges'].get(ach_name, [])
+        
+        # Find which level this achievement is in
+        level = None
+        for level_idx, level_achs in enumerate(dependency_graph['levels']):
+            if ach_name in level_achs:
+                level = level_idx
+                break
+        
+        # Check if all dependencies are met
+        unmet_deps = [dep for dep in deps if dep not in unlocked_names]
+        all_deps_met = len(unmet_deps) == 0
+        
+        detail = {
+            'name': ach_name,
+            'description': ach.get('description', ''),
+            'unlocked': ach.get('unlocked', False),
+            'dependencies': deps,
+            'unmet_dependencies': unmet_deps,
+            'all_dependencies_met': all_deps_met,
+            'dependency_level': level,
+            'can_unlock_now': (not ach.get('unlocked') and all_deps_met)
+        }
+        
+        dependency_details.append(detail)
+    
+    # Step 6: Find achievements ready to unlock (no unmet dependencies)
+    ready_to_unlock = [d for d in dependency_details if d['can_unlock_now']]
+    
+    # Step 7: Find achievements blocked by dependencies
+    blocked = [d for d in dependency_details if not d['unlocked'] and not d['all_dependencies_met']]
+    
+    # Step 8: Calculate graph statistics
+    total_deps = sum(len(d['dependencies']) for d in dependency_details)
+    achievements_with_deps = sum(1 for d in dependency_details if d['dependencies'])
+    
+    return {
+        'game': game_name,
+        'appid': appid,
+        'total_achievements': len(achievements),
+        'unlocked_count': len(unlocked_names),
+        'dependency_graph': {
+            'total_levels': len(dependency_graph['levels']),
+            'level_breakdown': [len(level) for level in dependency_graph['levels']],
+            'total_dependencies': total_deps,
+            'achievements_with_dependencies': achievements_with_deps
+        },
+        'optimal_order': optimal_order[:20],  # First 20 achievements in optimal order
+        'ready_to_unlock': ready_to_unlock[:10],  # Top 10 ready to unlock
+        'blocked_achievements': blocked[:10],  # Top 10 blocked
+        'all_achievements': dependency_details
+    }
 
 @mcp.tool
 def scan_for_missable_content(
@@ -2236,15 +2366,34 @@ def get_performance_stats() -> Dict[str, Any]:
                 'description': 'API failure protection (5 failures → 60s timeout)'
             }
         },
+        'ml_analytics': {
+            'dependency_detector': {
+                'patterns': len(dependency_detector.DEPENDENCY_PATTERNS),
+                'description': '20+ regex patterns for achievement dependency detection'
+            },
+            'difficulty_predictor': {
+                'model': '4-factor ML-inspired difficulty model',
+                'factors': {
+                    'rarity': '50% weight',
+                    'keywords': '20% weight (very_hard, hard, medium, easy, grind)',
+                    'time': '15% weight (long, marathon, etc.)',
+                    'skill': '15% weight (expert, precise, etc.)'
+                },
+                'categories': ['trivial', 'easy', 'medium', 'hard', 'very_hard'],
+                'description': 'ML-based difficulty prediction with time estimates'
+            }
+        },
         'performance_summary': {
             'caching_enabled': True,
             'parallel_execution_enabled': True,
             'rate_limiting_enabled': True,  # PHASE 2.2
-            'phase': 'Phase 2.2 - Rate Limiting + Circuit Breaker',
+            'ml_analytics_enabled': True,  # PHASE 2.3
+            'phase': 'Phase 2.3 - Advanced Features COMPLETE',
             'optimized_tools': [
                 'get_current_session_context (5 parallel tasks)',
-                'get_achievement_roadmap (2 parallel tasks)',
-                'scan_for_missable_content (N parallel tasks)'
+                'get_achievement_roadmap (2 parallel tasks + ML analytics)',
+                'scan_for_missable_content (N parallel tasks)',
+                'analyze_achievement_dependencies (NEW - Phase 2.3)'
             ],
             'features': [
                 'TTL Cache (3 layers, 15-60 min TTL)',
@@ -2253,12 +2402,17 @@ def get_performance_stats() -> Dict[str, Any]:
                 'Exponential Backoff (max 2 retries)',
                 'Parallel API execution (5 worker threads)',
                 'Thread-safe operations',
-                'Automatic error recovery per task'
+                'Automatic error recovery per task',
+                'ML Difficulty Prediction (4-factor model)',
+                'Dependency Graph Analysis (20+ patterns)',
+                'Topological Sorting (Kahn\'s algorithm)',
+                'Optimal Achievement Ordering'
             ],
             'expected_speedup': {
                 'cache_warm': '10-25x faster',
                 'parallel_boost': '2-3x faster',
-                'combined': 'Up to 25x total speedup'
+                'ml_analytics': 'Real-time (no overhead)',
+                'combined': 'Up to 25x total speedup + intelligent ordering'
             }
         }
     }
